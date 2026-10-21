@@ -1,3 +1,4 @@
+import { create } from "@bufbuild/protobuf";
 import {
   Bot,
   CircleDot,
@@ -23,6 +24,11 @@ import {
   useState,
 } from "react";
 import { useTranslation } from "react-i18next";
+import {
+  databaseServiceClientConnect,
+  instanceServiceClientConnect,
+  projectServiceClientConnect,
+} from "@/api";
 import { router } from "@/app/router";
 import {
   DATABASE_ROUTE_DASHBOARD,
@@ -64,6 +70,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { WorkspacePageLayout } from "@/components/WorkspacePageLayout";
 import {
   useOptionalCurrentUser,
+  usePlanFeature,
   useServerState,
   useWorkspace,
   useWorkspacePermission,
@@ -73,6 +80,8 @@ import {
   AI_ASSISTANT_PRODUCT_INTRO,
   PRODUCT_INTRO_QUERY_KEY,
 } from "@/lib/productIntro";
+import { LandingStarterSelector } from "@/modules/agent/components/LandingStarterSelector";
+import { getLandingStarterIds } from "@/modules/agent/logic/landingStarters";
 import {
   selectHasRunningChat,
   useAgentStore,
@@ -80,8 +89,15 @@ import {
 import { useAppStore } from "@/stores/app";
 import { projectNamePrefix } from "@/stores/modules/v1/common";
 import { UNKNOWN_PROJECT_NAME } from "@/types";
-import type { Project } from "@/types/proto-es/v1/project_service_pb";
+import { ListDatabasesRequestSchema } from "@/types/proto-es/v1/database_service_pb";
+import { ListInstancesRequestSchema } from "@/types/proto-es/v1/instance_service_pb";
+import {
+  type Project,
+  SearchProjectsRequestSchema,
+} from "@/types/proto-es/v1/project_service_pb";
+import { PlanFeature } from "@/types/proto-es/v1/subscription_service_pb";
 import { extractProjectResourceName, storageKeyQuickAccess } from "@/utils";
+import { isSaaSOrDev } from "@/utils/featureGates";
 import { WorkspaceLandingGettingStarted } from "./WorkspaceLandingGettingStarted";
 
 // ---------------------------------------------------------------------------
@@ -450,6 +466,7 @@ function ConfigSheet({
 
 export function LandingPage(_: Record<string, never> = {}) {
   const { t } = useTranslation();
+  const hasAuditLogFeature = usePlanFeature(PlanFeature.FEATURE_AUDIT_LOG);
   const [showConfigDrawer, setShowConfigDrawer] = useState(false);
   const [aiPrompt, setAiPrompt] = useState("");
   const workspace = useWorkspace();
@@ -460,8 +477,14 @@ export function LandingPage(_: Record<string, never> = {}) {
     (state) => state.queuedUserMessage !== null
   );
 
-  const email = useOptionalCurrentUser()?.email ?? "";
+  const currentUser = useOptionalCurrentUser();
+  const email = currentUser?.email ?? "";
   const { isSaaSMode, version, changelogURL } = useServerState();
+  const landingAgentEnabled = isSaaSOrDev(isSaaSMode);
+  const canSearchAuditLogs = useWorkspacePermission("bb.auditLogs.search");
+  const [setupResources, setSetupResources] = useState<
+    "loading" | "present" | "empty" | "unknown"
+  >("loading");
 
   const fullList = useFullQuickLinkList();
   const { config, setConfig } = useQuickAccessConfig(email);
@@ -486,6 +509,67 @@ export function LandingPage(_: Record<string, never> = {}) {
     }
   }, []);
 
+  useEffect(() => {
+    if (!landingAgentEnabled || !aiEnabled || !workspace?.name) {
+      setSetupResources("unknown");
+      return;
+    }
+    let active = true;
+    setSetupResources("loading");
+    const hasProject = projectServiceClientConnect
+      .searchProjects(
+        create(SearchProjectsRequestSchema, {
+          filter: 'exclude_default == true && state == "ACTIVE"',
+          pageSize: 1,
+          orderBy: "title",
+          showDeleted: false,
+        })
+      )
+      .then(({ projects }) => projects.length > 0);
+    const hasInstance = instanceServiceClientConnect
+      .listInstances(
+        create(ListInstancesRequestSchema, {
+          pageSize: 1,
+          showDeleted: false,
+        })
+      )
+      .then(({ instances }) => instances.length > 0);
+    const hasDatabase = databaseServiceClientConnect
+      .listDatabases(
+        create(ListDatabasesRequestSchema, {
+          parent: workspace.name,
+          pageSize: 1,
+          showDeleted: false,
+        })
+      )
+      .then(({ databases }) => databases.length > 0);
+    void Promise.allSettled([hasProject, hasInstance, hasDatabase]).then(
+      (results) => {
+        if (!active) return;
+        if (
+          results.some(
+            (result) => result.status === "fulfilled" && result.value
+          )
+        ) {
+          setSetupResources("present");
+        } else if (results.every((result) => result.status === "fulfilled")) {
+          setSetupResources("empty");
+        } else {
+          setSetupResources("unknown");
+        }
+      }
+    );
+    return () => {
+      active = false;
+    };
+  }, [aiEnabled, landingAgentEnabled, workspace?.name]);
+
+  const landingStarterIds = getLandingStarterIds({
+    scope: "workspace",
+    setupResources,
+    canViewRecentActivity: hasAuditLogFeature && canSearchAuditLogs,
+  });
+
   const sendAIMessage = () => {
     const text = aiPrompt.trim();
     if (!text || !aiEnabled || !workspace?.name) return;
@@ -495,10 +579,41 @@ export function LandingPage(_: Record<string, never> = {}) {
       path: `${window.location.pathname}${window.location.search}${window.location.hash}`,
       title: document.title,
     };
-    const chat = store.createChat({ context: workspace.name, page });
+    const chat = store.selectOrCreateChatForContext(
+      workspace.name,
+      page,
+      workspace.name
+    );
+    if (!chat) return;
     store.queueUserMessage({ chatId: chat.id, text, page });
     store.open();
     setAiPrompt("");
+  };
+
+  const sendLandingStarter = (
+    starterId: (typeof landingStarterIds)[number]
+  ) => {
+    if (!aiEnabled || !workspace?.name) return;
+    const store = useAgentStore.getState();
+    if (selectHasRunningChat(store) || store.queuedUserMessage) return;
+    const page = {
+      path: `${window.location.pathname}${window.location.search}${window.location.hash}`,
+      title: document.title,
+    };
+    const chat = store.selectOrCreateChatForContext(
+      workspace.name,
+      page,
+      workspace.name
+    );
+    if (!chat) return;
+    store.queueUserMessage({
+      chatId: chat.id,
+      text: t(`agent.landing-starters.${starterId}`),
+      page,
+      runMode: "read-only",
+      starterId,
+    });
+    store.open();
   };
 
   return (
@@ -511,7 +626,7 @@ export function LandingPage(_: Record<string, never> = {}) {
             </h1>
           </header>
 
-          {aiEnabled && workspace?.name && (
+          {landingAgentEnabled && aiEnabled && workspace?.name && (
             <form
               className="min-w-0 rounded-sm border border-accent/60 bg-background focus-within:border-accent focus-within:ring-1 focus-within:ring-accent"
               onSubmit={(event) => {
@@ -519,6 +634,15 @@ export function LandingPage(_: Record<string, never> = {}) {
                 sendAIMessage();
               }}
             >
+              {!aiPrompt.trim() && (
+                <div className="px-3 pt-2">
+                  <LandingStarterSelector
+                    starterIds={landingStarterIds}
+                    disabled={hasRunningChat || hasQueuedMessage}
+                    onSelect={sendLandingStarter}
+                  />
+                </div>
+              )}
               <Textarea
                 size="md"
                 rows={2}
